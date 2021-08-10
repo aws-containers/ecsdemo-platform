@@ -7,7 +7,10 @@ from aws_cdk import (
     aws_iam,
     aws_ssm,
     aws_autoscaling,
-    core
+    core,
+    aws_appmesh,
+    aws_ecs_patterns,
+    aws_logs
 )
 
 from os import getenv
@@ -29,13 +32,15 @@ class BaseVPCStack(core.Stack):
         self.ecs_cluster = aws_ecs.Cluster(
             self, "ECSCluster",
             vpc=self.vpc,
-            cluster_name="container-demo"
+            cluster_name="container-demo",
+            container_insights=True
         )
 
         # Adding service discovery namespace to cluster
         self.ecs_cluster.add_default_cloud_map_namespace(
-            name="service",
+            name="service.local",
         )
+        
         
         ###### CAPACITY PROVIDERS SECTION #####
         # Adding EC2 capacity to the ECS Cluster
@@ -203,7 +208,10 @@ class BaseVPCStack(core.Stack):
             user_data=aws_ec2.UserData.custom(user_data),
             security_group=self.services_3000_sec_group
                 )
-     
+        
+        # App Mesh Configuration
+        # self.appmesh()
+        
         # All Outputs required for other stacks to build
         core.CfnOutput(self, "NSArn", value=self.namespace_outputs['ARN'], export_name="NSARN")
         core.CfnOutput(self, "NSName", value=self.namespace_outputs['NAME'], export_name="NSNAME")
@@ -214,6 +222,124 @@ class BaseVPCStack(core.Stack):
         core.CfnOutput(self, "ServicesSecGrp", value=self.services_3000_sec_group.security_group_id, export_name="ServicesSecGrp")
         core.CfnOutput(self, "StressToolEc2Id",value=self.instance.instance_id)
         core.CfnOutput(self, "StressToolEc2Ip",value=self.instance.instance_private_ip)
+    
+    
+    def appmesh(self):
+        
+        # Creates the app mesh
+        self.mesh = aws_appmesh.Mesh(self,"EcsWorkShop-AppMesh", mesh_name="ecs-mesh")
+        
+        # Mesh Virtual Gateway
+        self.mesh_vgw = aws_appmesh.VirtualGateway(
+            self,
+            "Mesh-VGW",
+            mesh=self.mesh,
+            listeners=[aws_appmesh.VirtualGatewayListener.http(
+                port=3000
+                )],
+            virtual_gateway_name="ecsworkshop-vgw"
+        )
+        
+        # Creating the mesh gateway for the frontend app
+        # For more info related to App Mesh Proxy check https://docs.aws.amazon.com/app-mesh/latest/userguide/getting-started-ecs.html
+        self.mesh_gw_proxy_task_def = aws_ecs.FargateTaskDefinition(
+            self,
+            "mesh-gw-proxy-taskdef",
+            cpu=256,
+            memory_limit_mib=512,
+            family="mesh-gw-proxy-taskdef",
+        )
+        
+        self.logGroup = aws_logs.LogGroup(self,"ECS",
+            log_group_name="ecsworkshop-mesh-gateway",
+            retention=aws_logs.RetentionDays.ONE_WEEK
+        )
+        
+        self.container = self.mesh_gw_proxy_task_def.add_container(
+            "mesh-gw-proxy-contdef",
+            image=aws_ecs.ContainerImage.from_registry("public.ecr.aws/appmesh/aws-appmesh-envoy:v1.18.3.0-prod"),
+            container_name="envoy",
+            memory_reservation_mib=512,
+            environment={
+                "REGION": getenv('AWS_DEFAULT_REGION'),
+                "ENVOY_LOG_LEVEL": "debug",
+                "ENABLE_ENVOY_STATS_TAGS": "1",
+                "ENABLE_ENVOY_XRAY_TRACING": "1",
+                "APPMESH_RESOURCE_ARN": self.mesh_vgw.virtual_gateway_arn
+            },
+            essential=True,
+            logging=aws_ecs.LogDriver.aws_logs(
+                stream_prefix='/mesh-gateway',
+                log_group=self.logGroup
+            ),
+            health_check=aws_ecs.HealthCheck(
+                command=["CMD-SHELL","curl -s http://localhost:9901/server_info | grep state | grep -q LIVE"],
+            )
+        )
+        
+        self.container.add_port_mappings(
+            aws_ecs.PortMapping(
+                container_port=3000
+            )
+        )
+        
+        # For a different region than us-west-2 please check https://docs.aws.amazon.com/app-mesh/latest/userguide/envoy.html
+        # For environment variables check https://docs.aws.amazon.com/app-mesh/latest/userguide/envoy-config.html
+        
+        self.mesh_gateway_proxy_fargate_service = aws_ecs_patterns.NetworkLoadBalancedFargateService(
+            self,
+            "MeshGW-Proxy-Fargate-Service",
+            service_name='mesh-gw-proxy',
+            cpu=256,
+            memory_limit_mib=512,
+            desired_count=1,
+            listener_port=80,
+            assign_public_ip=True,
+            task_definition=self.mesh_gw_proxy_task_def,
+            cluster=self.ecs_cluster,
+            public_load_balancer=True,
+            cloud_map_options=aws_ecs.CloudMapOptions(
+                cloud_map_namespace=self.ecs_cluster.default_cloud_map_namespace,
+                name='mesh-gw-proxy'
+            )
+            # deployment_controller,
+            # circuit_breaker,
+        )
+        
+        self.mesh_gateway_proxy_fargate_service.service.connections.allow_from_any_ipv4(
+            port_range=aws_ec2.Port(protocol=aws_ec2.Protocol.TCP, string_representation="vtw_proxy", from_port=3000, to_port=3000),
+            description="Allow NLB connections on port 3000"
+        )
+        
+        self.mesh_gw_proxy_task_def.default_container.add_ulimits(aws_ecs.Ulimit(
+            hard_limit=15000,
+            name=aws_ecs.UlimitName.NOFILE,
+            soft_limit=15000
+            )
+        )
+        
+        self.mesh_gw_proxy_task_def.execution_role.add_managed_policy(aws_iam.ManagedPolicy.from_aws_managed_policy_name("AmazonEC2ContainerRegistryReadOnly"))
+        self.mesh_gw_proxy_task_def.execution_role.add_managed_policy(aws_iam.ManagedPolicy.from_aws_managed_policy_name("CloudWatchLogsFullAccess"))
+        
+        self.mesh_gw_proxy_task_def.task_role.add_managed_policy(aws_iam.ManagedPolicy.from_aws_managed_policy_name("CloudWatchFullAccess"))
+        self.mesh_gw_proxy_task_def.task_role.add_managed_policy(aws_iam.ManagedPolicy.from_aws_managed_policy_name("AWSXRayDaemonWriteAccess"))
+        self.mesh_gw_proxy_task_def.task_role.add_managed_policy(aws_iam.ManagedPolicy.from_aws_managed_policy_name("AWSAppMeshEnvoyAccess"))
+        
+        self.mesh_gw_proxy_task_def.execution_role.add_to_policy(
+            aws_iam.PolicyStatement(
+                actions=['ec2:DescribeSubnets'],
+                resources=['*']
+            )
+        )
+        
+        core.CfnOutput(self, "MeshGwNlbDns",value=self.mesh_gateway_proxy_fargate_service.load_balancer.load_balancer_dns_name,export_name="MeshGwNlbDns")
+        core.CfnOutput(self, "MeshArn",value=self.mesh.mesh_arn,export_name="MeshArn")
+        core.CfnOutput(self, "MeshName",value=self.mesh.mesh_name,export_name="MeshName")
+        core.CfnOutput(self, "MeshEnvoyServiceArn",value=self.mesh_gateway_proxy_fargate_service.service.service_arn,export_name="MeshEnvoyServiceArn")
+        core.CfnOutput(self, "MeshVGWArn",value=self.mesh_vgw.virtual_gateway_arn,export_name="MeshVGWArn")
+        core.CfnOutput(self, "MeshVGWName",value=self.mesh_vgw.virtual_gateway_name,export_name="MeshVGWName")
+        
+        
 
 
 _env = core.Environment(account=getenv('AWS_ACCOUNT_ID'), region=getenv('AWS_DEFAULT_REGION'))
