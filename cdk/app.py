@@ -250,8 +250,8 @@ class BaseVPCStack(core.Stack):
             family="mesh-gw-proxy-taskdef",
         )
         
-        self.logGroup = aws_logs.LogGroup(self,"ECS",
-            log_group_name="ecsworkshop-mesh-gateway",
+        self.logGroup = aws_logs.LogGroup(self,"ecsworkshopMeshGateway",
+            #log_group_name="ecsworkshop-mesh-gateway",
             retention=aws_logs.RetentionDays.ONE_WEEK
         )
         
