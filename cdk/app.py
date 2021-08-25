@@ -224,12 +224,14 @@ class BaseVPCStack(core.Stack):
         core.CfnOutput(self, "StressToolEc2Ip",value=self.instance.instance_private_ip)
     
     
+    
+    # function to create app mesh
     def appmesh(self):
         
-        # Creates the app mesh
+        # This will create the app mesh (control plane)
         self.mesh = aws_appmesh.Mesh(self,"EcsWorkShop-AppMesh", mesh_name="ecs-mesh")
         
-        # Mesh Virtual Gateway
+        # We will create a App Mesh Virtual Gateway
         self.mesh_vgw = aws_appmesh.VirtualGateway(
             self,
             "Mesh-VGW",
@@ -240,7 +242,7 @@ class BaseVPCStack(core.Stack):
             virtual_gateway_name="ecsworkshop-vgw"
         )
         
-        # Creating the mesh gateway for the frontend app
+        # Creating the mesh gateway task for the frontend app
         # For more info related to App Mesh Proxy check https://docs.aws.amazon.com/app-mesh/latest/userguide/getting-started-ecs.html
         self.mesh_gw_proxy_task_def = aws_ecs.FargateTaskDefinition(
             self,
@@ -249,22 +251,25 @@ class BaseVPCStack(core.Stack):
             memory_limit_mib=512,
             family="mesh-gw-proxy-taskdef",
         )
-        
+
+        # LogGroup for the App Mesh Proxy Task
         self.logGroup = aws_logs.LogGroup(self,"ecsworkshopMeshGateway",
             #log_group_name="ecsworkshop-mesh-gateway",
             retention=aws_logs.RetentionDays.ONE_WEEK
         )
         
-        self.container = self.mesh_gw_proxy_task_def.add_container(
+        # App Mesh Virtual Gateway Envoy proxy Task definition
+        # For a use specific ECR region, please check https://docs.aws.amazon.com/app-mesh/latest/userguide/envoy.html
+        container = self.mesh_gw_proxy_task_def.add_container(
             "mesh-gw-proxy-contdef",
             image=aws_ecs.ContainerImage.from_registry("public.ecr.aws/appmesh/aws-appmesh-envoy:v1.18.3.0-prod"),
             container_name="envoy",
-            memory_reservation_mib=512,
+            memory_reservation_mib=256,
             environment={
                 "REGION": getenv('AWS_DEFAULT_REGION'),
-                "ENVOY_LOG_LEVEL": "debug",
+                "ENVOY_LOG_LEVEL": "info",
                 "ENABLE_ENVOY_STATS_TAGS": "1",
-                "ENABLE_ENVOY_XRAY_TRACING": "1",
+                # "ENABLE_ENVOY_XRAY_TRACING": "1",
                 "APPMESH_RESOURCE_ARN": self.mesh_vgw.virtual_gateway_arn
             },
             essential=True,
@@ -277,15 +282,35 @@ class BaseVPCStack(core.Stack):
             )
         )
         
-        self.container.add_port_mappings(
+        # Default port where frontend app is listening
+        container.add_port_mappings(
             aws_ecs.PortMapping(
                 container_port=3000
             )
         )
         
-        # For a different region than us-west-2 please check https://docs.aws.amazon.com/app-mesh/latest/userguide/envoy.html
-        # For environment variables check https://docs.aws.amazon.com/app-mesh/latest/userguide/envoy-config.html
+        #ammmesh-xray-uncomment
+        # xray_container = self.mesh_gw_proxy_task_def.add_container(
+        #     "FrontendServiceXrayContdef",
+        #     image=aws_ecs.ContainerImage.from_registry("amazon/aws-xray-daemon"),
+        #     logging=aws_ecs.LogDriver.aws_logs(
+        #         stream_prefix='/xray-container',
+        #         log_group=self.logGroup
+        #     ),
+        #     essential=True,
+        #     container_name="xray",
+        #     memory_reservation_mib=256,
+        #     user="1337"
+        # )
         
+        # container.add_container_dependencies(aws_ecs.ContainerDependency(
+        #       container=xray_container,
+        #       condition=aws_ecs.ContainerDependencyCondition.START
+        #   )
+        # )
+        #ammmesh-xray-uncomment
+        
+        # For environment variables check https://docs.aws.amazon.com/app-mesh/latest/userguide/envoy-config.html
         self.mesh_gateway_proxy_fargate_service = aws_ecs_patterns.NetworkLoadBalancedFargateService(
             self,
             "MeshGW-Proxy-Fargate-Service",
@@ -302,10 +327,9 @@ class BaseVPCStack(core.Stack):
                 cloud_map_namespace=self.ecs_cluster.default_cloud_map_namespace,
                 name='mesh-gw-proxy'
             )
-            # deployment_controller,
-            # circuit_breaker,
         )
         
+        # For testing purposes we will open any ipv4 requests to port 3000
         self.mesh_gateway_proxy_fargate_service.service.connections.allow_from_any_ipv4(
             port_range=aws_ec2.Port(protocol=aws_ec2.Protocol.TCP, string_representation="vtw_proxy", from_port=3000, to_port=3000),
             description="Allow NLB connections on port 3000"
@@ -318,11 +342,12 @@ class BaseVPCStack(core.Stack):
             )
         )
         
+        #Adding necessary policies for Envoy proxy to communicate with required services
         self.mesh_gw_proxy_task_def.execution_role.add_managed_policy(aws_iam.ManagedPolicy.from_aws_managed_policy_name("AmazonEC2ContainerRegistryReadOnly"))
         self.mesh_gw_proxy_task_def.execution_role.add_managed_policy(aws_iam.ManagedPolicy.from_aws_managed_policy_name("CloudWatchLogsFullAccess"))
         
         self.mesh_gw_proxy_task_def.task_role.add_managed_policy(aws_iam.ManagedPolicy.from_aws_managed_policy_name("CloudWatchFullAccess"))
-        self.mesh_gw_proxy_task_def.task_role.add_managed_policy(aws_iam.ManagedPolicy.from_aws_managed_policy_name("AWSXRayDaemonWriteAccess"))
+        # self.mesh_gw_proxy_task_def.task_role.add_managed_policy(aws_iam.ManagedPolicy.from_aws_managed_policy_name("AWSXRayDaemonWriteAccess"))
         self.mesh_gw_proxy_task_def.task_role.add_managed_policy(aws_iam.ManagedPolicy.from_aws_managed_policy_name("AWSAppMeshEnvoyAccess"))
         
         self.mesh_gw_proxy_task_def.execution_role.add_to_policy(
