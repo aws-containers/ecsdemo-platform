@@ -6,3 +6,4 @@ aws-cdk.aws_ecs_patterns
 aws-cdk.aws_iam
 aws-cdk.aws_ssm
 aws-cdk.aws_autoscaling
+aws-cdk.aws_appmesh
